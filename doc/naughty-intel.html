@@ -1,0 +1,324 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+<HEAD>
+   <META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1">
+   <META NAME="Description" CONTENT="Intel naughtiness with their compiler.">
+   <TITLE>Intel compiler crippled on AMD chips!</TITLE>
+</HEAD>
+<BODY TEXT="#000000" BGCOLOR="#FFFFFF" LINK="#0000EF" VLINK="#55188A" ALINK="#FF0000">
+
+<div class="contents">
+<H1>Intel's compiler: is crippling the competition acceptable?</H1>
+
+<p>UPDATE: new scripts are available for patching the compiler and/or the executables compiled with the
+compiler. See <A HREF='#patches'>here</A> for details.
+
+<p>FURTHER UPDATE 22/9/05: The scripts have been updated to patch a wider variety of Intel compiler versions.
+
+<p>FURTHER FURTHER UPDATE 03/10/05: The scripts have been updated to cope with systems using different LANGUAGE
+settings, and have been checked on the 64-bit compiler fce_9.0.027.
+
+<p>FURTHER FURTHER FURTHER UPDATE 29/11/05: Those naughty people at
+Intel keep changing the check code. The scripts have been updated to be
+able to patch icc 9.0 20050430.
+
+<p>AND ANOTHER 8/12/05: Sheesh, you'd think I'd have learned not to make schoolboy Perl errors by now. Fixed scripts to
+correctly patch icc 9.0 programs.
+
+<h2>The Problem</h2>
+
+<p>A while ago I upgraded my copy of the Intel Fortran Compiler for Linux (to version 7.1.040, build 20040309Z).
+All seemed well, and the code compiled with the new version passed all of our unit tests. However, when we moved
+the new executables out to our compute farm they started segfaulting all over the place. What was going on?
+
+<h2>The investigation</h2>
+
+<p>The code in question is several hundred thousand lines of old-style poorly commented Fortran 77, with a bit
+of C mixed in to make things more interesting. We've had problems before with compiler upgrades, so having the
+new compiler produce code which didn't work wasn't completely surprising. However, this one seemed odder than
+usual: the executables all seemed to pan out fine on the compile machine, but fail on the compute farm. Running
+gdb indicated that they segfaulted in a routine called <i>__intel_cpu_dispatch_fail</i>, which wasn't enormously
+productive. The stack trace showed which routine in our code led to the <i>__intel_cpu_dispatch_fail</i>
+segfault, but it was a pretty simple routine and there wasn't anything obviously wrong with it.
+
+<p>We've seen bugs with the Intel compilers before (and with other compilers too, I might add) where the
+optimiser caused problems. Sure enough, compiling with all of the optimisation flags turned off produced
+executables that ran perfectly fine across our collection of machines, albeit rather slowly. Reinstating the
+optimisation flags one-at-a-time revealed that the -xK flag was the culprit: if that was specified, the
+executables segfaulted on the compute farm, if not, they didn't.
+
+<p>The -xK flag to the 'ifc' compiler specifies that SSE instructions should be used (the equivalent to gcc's
+-fpmath=sse). If we compiled with -axK (produce both normal 386 code and SSE code and decide at runtime which to
+use), then all was OK. So, it looked like some sort of bug with the SSE code emitted by the compiler, so I was
+tempted simply to downgrade again and wait for the <em>next</em> version, which hopefully would have fixed the
+bug.
+
+<p>I cast a final eye over the last run on the compute farm, and noticed that while most of the machines
+segfaulted on the -ax code, a few didn't. Interestingly, the ones on which the code worked were all
+single-processor Pentium 4s, which the ones on which it crashed were all dual-processor Athlon MPs. Hmmm. It's
+either an SMP bug or an AMD bug, and I was interested enough to try and work out which.
+
+<p>Tracing the code up to the segfault on one of the Athlons, I found the smoking gun in an exponential routine:
+
+<DIV ID="code">
+<PRE>
+(gdb) break vmlsExp4
+Breakpoint 1 at 0x8106340
+(gdb) run probe.dat probe.dat
+Starting program: fastqmf probe.dat probe.dat
+
+Breakpoint 1, 0x08106340 in vmlsExp4 ()
+(gdb) disas
+Dump of assembler code for function vmlsExp4:
+0x08106340 &lt;vmlsExp4+0&gt;  testl  $0xffffff00,0xedb375c
+0x0810634a &lt;vmlsExp4+10&gt; jne    0x8106760 &lt;vmlsExp4.I&gt;
+0x08106350 &lt;vmlsExp4+16&gt; testl  $0xffffff80,0xedb375c
+0x0810635a &lt;vmlsExp4+26&gt; jne    0x8106464 &lt;vmlsExp4.H&gt;
+0x08106360 &lt;vmlsExp4+32&gt; testl  $0xffffffff,0xedb375c
+0x0810636a &lt;vmlsExp4+42&gt; jne    0x816c9f8 &lt;__intel_cpu_dispatch_fail&gt;
+0x08106370 &lt;vmlsExp4+48&gt; call   0x816c89a &lt;__intel_cpu_indicator_init&gt;
+0x08106375 &lt;vmlsExp4+53&gt; jmp    0x8106340 &lt;vmlsExp4&gt;
+0x08106377 &lt;vmlsExp4+55&gt; ret
+End of assembler dump.
+</PRE>
+</DIV>
+
+<p><i>vmlsExp4</i> is (I managed to work out) the vectorised exponential routine. What this code does is check the
+bits of a global variable. If it's 0x100 or greater, then call <i>vmlsExp4.I</i> (which contains SSE2 code), otherwise
+if it's 0x80 or greater, call <i>vmlsExp4.H</i> (which contains SSE code), otherwise if it's 0 call
+<i>__intel_cpu_indicator_init</i>, otherwise call <i>__intel_cpu_dispatch_fail</i> (which simply segfaults nastily by doing a
+'movl   $0x1,0x0').
+
+<p>Looking at <i>__intel_cpu_indicator_init</i>, it goes and checks the various processor capabilities and sets the
+global variable at 0xedb375c to a value depending on the processor capabilities. If you can do SSE2, the value
+is 0x200. If you can only do SSE1, you get 0x80, and so on. If you can't do anything, you get the value 0x1. What
+is odd is that the Athlon chips can do SSE quite happily, but seem to end up with a value 0x1 anyway. Tracing
+through the code on a P4 and an Athlon revealed the culprit (in <i>__intel_cpu_indicator_init</i>).
+
+<DIV ID="code">
+<PRE>
+ 15f:   0f a2           cpuid
+ 161:   89 45 fc        mov    %eax,0xfffffffc(%ebp)
+ 164:   89 5d f8        mov    %ebx,0xfffffff8(%ebp)
+ 167:   89 4d f4        mov    %ecx,0xfffffff4(%ebp)
+ 16a:   89 55 f0        mov    %edx,0xfffffff0(%ebp)
+(snip)
+ 19f:   8b 45 f8        mov    0xfffffff8(%ebp),%eax
+ 1a2:   3d 47 65 6e 75  cmp    $0x756e6547,%eax
+ 1a7:   bb 01 00 00 00  mov    $0x1,%ebx
+ 1ac:   75 18           jne    1c6 &lt;__intel_cpu_indicator_init+0x8c&gt;
+ 1ae:   8b 45 f0        mov    0xfffffff0(%ebp),%eax
+ 1b1:   3d 69 6e 65 49  cmp    $0x49656e69,%eax
+ 1b6:   75 0e           jne    1c6 &lt;__intel_cpu_indicator_init+0x8c&gt;
+ 1b8:   8b 45 f4        mov    0xfffffff4(%ebp),%eax
+ 1bb:   3d 6e 74 65 6c  cmp    $0x6c65746e,%eax
+ 1c0:   75 04           jne    1c6 &lt;__intel_cpu_indicator_init+0x8c&gt;
+</PRE>
+</DIV>
+
+<p>The 'cpuid' call here puts the CPU manufacturer's ID in ebx:edx:ecx. The 'cmp' instructions later then check
+that these values were 'Genu','ineI','ntel' (i.e. 'GeniuneIntel'). If not, then we jump off to a bit of code
+that doesn't even pretend to check for the CPU capabilities but instead returns 0x1 (i.e it's a 386, and nothing
+other than the bog-standard 386 instruction set is available).
+
+<p>Think about what this means. The code produced by the Intel compiler checks to see if it's running on an
+Intel chip. If not, it deliberately won't run SSE or SSE2 code, even if the chip capability flags (available
+through the 'cpuid' instruction) say that it can. In other words, the code has been nobbled to run slower on
+non-Intel chips.
+
+<h2>Talking to Intel</h2>
+
+<p>I raised this with Intel through their 
+<A HREF="http://softwareforums.intel.com/ids/board/message?board.id=11&message.id=1583">compiler support
+forums</A>. The initial response from Intel was that 
+
+<p class="quote">The most recent update of 8.0 compilers should have fixed the run-time issue with -xW and -xK
+on AMD processors.  I don't believe the fix has been carried back to 7.1.   It's not deliberate, it's an
+oversight, due to AMD processors not being supported  or tested with those options.
+
+<p> followed later (after some discussion) by 
+
+<p class="quote">As Tim correctly pointed out, this was a bug introduced into the vector math library. It is
+fixed in the current 8.0 compilers.  There are no plans to fix it for 7.1.
+
+<p>It is worth noting at this point that Intel were in the process of phasing out support for their version 7.0
+compilers given that the version 8.0 compilers has been available for some time, so while the 'no plans to fix
+7.1' line was disappointing, it was perhaps not unexpected.
+
+<h2>Home-brewed patches</h2>
+
+<p>In the meantime, I'd seen enough performance gains with this version of the
+compiler over the previous version that we had used (at least on the Intel chips)
+to want to keep the upgrade. The solution? Patch the compiler! I wrote and made
+available a <A HREF="intel_check_patch_7.1.gz">simple patch</A> for one of the
+libraries included with the compiler which removed the 'GenuineIntel' check: any
+CPU ID string would now pass. Code compiled with the patched compiler works fine on
+both AMD and Intel chips because it can't tell the difference :).
+
+<h2>The plot thickens</h2>
+
+<p>Despite the fact that Intel were no longer officially supporting version 7.1 of
+their compiler, they did in fact release a new version (version 7.1.044 build
+20040901Z). I had a quick look at the code in <i>__intel_cpu_indicator_init</i> and
+it hadn't changed, so Intel had obviously not addressed this 'bug'. However, when I
+looked closer, I found something interesting. The code for vmlsExp4 looks like this
+with build 20040901Z:
+
+<DIV ID="code">
+<PRE>
+ 08106340 &lt;vmlsExp4&gt;
+ 8106340:       f7 05 1c 36 db 0e 00    testl  $0xffffff00,0xedb361c
+ 8106347:       ff ff ff
+ 810634a:       0f 85 28 00 00 00       jne    8106378 &lt;vmlsExp4.I&gt;
+ 8106350:       f7 05 1c 36 db 0e ff    testl  $0xffffffff,0xedb361c
+ 8106357:       ff ff ff
+ 810635a:       0f 85 28 02 00 00       jne    8106588 &lt;vmlsExp4.A&gt;
+ 8106360:       e8 35 64 06 00          call   816c79a &lt;__intel_cpu_indicator_init&gt;
+ 8106365:       eb d9                   jmp    8106340 &lt;vmlsExp4&gt;
+ 8106367:       c3                      ret
+</PRE>
+</DIV>
+
+<p>Compare this to the code produced by the older build.
+
+<TABLE class="bt">
+<TR><TH>Version</TH><TH>SSE2 available</TH><TH>SSE available</TH><TH>SSE not available</TH></TR>
+<TR><TH>Build 20040309Z</TH><TD>Run SSE2 code vmlsExp4.I</TD><TD>Run SSE code vmlsExp4.H</TD><TD>Segfault</TD></TR>
+<TR><TH>Build 20040901Z</TH><TD>Run SSE2 code vmlsExp4.I</TD><TD COLSPAN=2 class="centre">Run SSE code vmlsExp4.A</TD></TR>
+</TABLE>
+
+<p>Remember that non-Intel chips are found to have no ISA extensions available
+regardless of whether that's correct or not, so they fall into the last column.
+Also note that if the code was compiled with the -axK flag (i.e check if SSE is
+available and only use it if it is), then vmlsExp4 is never called in the first
+place on non-Intel chips, which are forced to go off and run 386 legacy
+non-vectorised code.
+
+<p>So, it looks like Intel did indeed address the bug of code compiled with -xK
+crashing on Athlon machines due to their nobbled CPUID check. However, they didn't
+fix it by removing the CPUID check, they fixed it by removing the 'is SSE
+available?' check. Note that nobody is going to release production code compiled
+with -xK, as even in the new version it will indeed crash if run on an old Pentium
+with no SSE support. Production code will be compiled with the -ax flags, and this
+won't even attempt to use any SSE/SSE2 instructions on non-Intel chips.
+
+<h2>Is version 8 any better?</h2>
+
+<p>We've now upgraded to version 8.1 of the Intel Fortran Compiler as it now
+compiles our code more-or-less successfully. I was hardly surprised when I
+inspected the code for <i>__intel_cpu_indicator_init</i>: it's more complicated
+than it was in version 7 (checking for SSE3 support, among other things), and all
+of the math intrinsics have SSE3 equivalents added, but the checking for
+'GenuineIntel' is still present. One difference is that Intel now openly admit that
+SSE3 functions are available only for Intel chips, but as far as I am aware it is
+not explicitly mentioned that code compiled with the -ax flags will not use any
+vectorisation on non-Intel processors and that SSE/SSE2 vectorisation is crippled
+on non-Intel processors.
+
+<h2>Benchmarks beware</h2>
+
+<p>In many of not most benchmarks, the Intel compiler produces the fastest code of
+any F77/F90 compiler.  However, care needs to be taken on non-Intel chips. Code
+compiled with -axW, for example, will not use ANY SSE or SSE2 instructions on
+non-Intel chips. This will almost certainly greatly impact performance. If the use
+of SSE2 is forced with -xW (which is what Intel sort-of-recommend for Opterons),
+then some SSE2 code will be used (as the code in the main program will use SSE2
+instructions), but calls to the vectorised single-precision math instrinsics will
+use SSE, not SSE2.
+
+<p>In most of not all cases, then, code compiled with the Intel Fortran Compiler
+(and presumably icc as well, although I haven't tested it) will run slower than it
+should on non-Intel CPUs due to deliberate targeting of non-Intel CPUs by the
+compiler engineers. Benchmarks comparing the performance of AMD and Intel CPUs
+should beware of using the Intel compilers for this reason.
+
+<p>As an example, some (internal) code was compiled with ifc version 8.1.028 build
+20050520Z twice. For the second compile, the Intel CPU check was patched out of the
+compiler and replaced with a no-op. The code is otherwise identical, compiled with
+'-O3 -fpp -tpp6 -ip -pad -w95 -cm -Vaxlib -static-libcxa'. The machines used are a
+dual-Opteron 248 and a P4 1.7 GHZ, values are seconds (lower is better, and note
+that the 'confs' test has a stochastic element and hence the times can vary by ~5%
+between runs).
+
+<TABLE>
+<TR><TH>CPU</TH><TH>Flags</TH><TH>Code</TH><TH>'Clique'</TH><TH>'Simplex'</TH><TH>'Confs'</TH></TR>
+<TR><TH>Opteron</TH><TD>-xW</TD><TD>Original</TH><TD>15.6</TD><TD>54.4</TD><TD>92.2</TD></TR>
+<TR><TH>Opteron</TH><TD>-axW</TD><TD>Original</TH><TD>26.7</TD><TD>123.4</TD><TD>114.2</TD></TR>
+<TR><TH>Opteron</TH><TD>-xW</TD><TD>Patched</TH><TD>14.8</TD><TD>49.1</TD><TD>96.5</TD></TR>
+<TR><TH>Opteron</TH><TD>-axW</TD><TD>Patched</TH><TD>15.1</TD><TD>49.7</TD><TD>91.4</TD></TR>
+<TR><TH>P4</TH><TD>-xW</TD><TD>Original</TH><TD>25.7</TD><TD>78.4</TD><TD>171.2</TD></TR>
+<TR><TH>P4</TH><TD>-axW</TD><TD>Original</TH><TD>26.3</TD><TD>79.7</TD><TD>171.2</TD></TR>
+<TR><TH>P4</TH><TD>-xW</TD><TD>Patched</TH><TD>25.8</TD><TD>78.9</TD><TD>172.6</TD></TR>
+<TR><TH>P4</TH><TD>-axW</TD><TD>Patched</TH><TD>26.4</TD><TD>78.1</TD><TD>169.9</TD></TR>
+</TABLE>
+
+<p>The results for all unit tests of the software were identical between the
+original and patched versions. As can be seen, patching out the 'GenuineIntel'
+check makes no difference to the P4, but increases the performance of the Opteron
+by up to 10%. If the code was compiled with '-axW', then the Opteron really
+suffers: the 'Simplex' test is more than two times slower (it uses lots of exp()
+calls, and hence really benefits from vectorisation).
+
+<A NAME="patches">
+<h2>Patch-the-compiler redux</h2>
+
+<p>I like my little cluster of Athlons, and I also like ifc version 8.1 because
+the code it produces is faster than the code from ifc7. I hereby make available
+two little Perl scripts to fix the problem: this one <A
+HREF="intel_check_patch.gz">patches the compiler</A> to remove all references
+to 'GenuineIntel', so that any executables compiled with the compiler will not be
+artificially crippled on AMD chips. The script has been tested with compiler
+versions 7.1.040, 8.1.028 and 9.0.024, and should work on other builds. It should
+also work on the EM64T version of the compiler (thanks to Craig Wiegert), and with
+the Intel C compiler, but hasn't been properly tested on that (if you can test it
+on ICC please do so and let me know!)
+
+<p>Patching the compiler is arguably against the terms of the EULA (it's a gray
+area), and you might not have permission (either UNIX permission or managerial
+permission) to do so. So, there's also a script to <A
+HREF="intel_check_executable_patch.gz">patch executables</A> compiled with the
+Intel compilers. Enjoy!
+
+<p>If someone comes across a version of ifc/icc for which these scripts don't
+work, please contact me and I'll update them. Both scripts may be freely modified
+and redistributed.
+
+<p><b>UPDATE</b> 22 Sep 2005: the scripts from the above links have been updated
+to patch a wider variety of intel compiler versions. If you downloaded and used them
+before, I would urge you to get the new versions and use those instead. I get the feeling
+that new versions of the compiler are deliberately using different registers etc. to 
+check the CPUID just to make these patches fail :). The question is, can I update
+the patches as fast as they update the compiler?
+
+<p><b>Further Update</b> 03 Oct 2005: fixed a minor bug on systems with different LANGUAGE
+settings. The executable patch script has been tested on the 64-bit compiler version fce_9.0.027.
+
+<p><b>Further Update</b> 27 Nov 2005: fixed to be able to patch icc 9.0
+build 20050430 (uses a different register for the check)
+
+<p><b>Further Update</b> 8 Dec 2005: fixed silly bug which meant some icc 9.0
+programs weren't patched fully.
+
+<h2>Conclusions</h2>
+
+<p>It is a shame that the Intel compiler, which use to be almost the no-brainer choice
+if your primary concern was fast code, is now being coerced into being a marketing
+tool. Crippling the output for non-Intel chips may mean that some published
+benchmarks may end up bogusly favouring Intel over AMD, but the cost is that if you
+want to release fast production code I can't recommend the (unpatched) compiler.
+There are an awful lot of AMD machines out there!
+
+<p>To Intel: there is a standard mechanism out there (invented by you!) for
+questioning a CPU as to its capabilities. You should be using that, not checking
+for the presence of your trademark. I don't expect Intel to support AMD-specific
+extensions, and I also don't expect Intel to have to test its compiler on AMD CPUs.
+However, if a CPU states that it can do SSE3 or whatever then I expect the code
+produced by the Intel compiler to use SSE3 instructions rather than to check first
+if the chip was made by Intel. It was not acceptable for Microsoft to go out and
+deliberately cripple Windows under DR-DOS, and likewise it isn't acceptable for you
+to cripple a product that you sell for not inconsequential sums of money so that it
+won't perform properly on competitors' hardware.
+
+</div>
+</body>
+</html>
