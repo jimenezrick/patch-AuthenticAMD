@@ -7,7 +7,7 @@ PREFIX = /usr/local
 all: patch-AuthenticAMD
 
 install: all
-	install -D -m 755 -o root -g root patch-AuthenticAMD ${DESTDIR}/${PREFIX}/bin/patch-AuthenticAMD
+	install -D -m 755 -o root -g root patch-AuthenticAMD ${DESTDIR}${PREFIX}/bin/patch-AuthenticAMD
 
 uninstall:
 	rm -f ${PREFIX}/bin/patch-AuthenticAMD
